@@ -1,0 +1,344 @@
+# Upload an APK, get it back patched with a real-time voice changer (LSPatch, no root).
+#
+# Setup: put this file in a PRIVATE GitHub repo at .github/workflows/patch-apk.yml
+# Use:   Releases -> Draft a new release -> attach the APK (or .apkm/.xapk/.apks bundle) -> Publish.
+#        Patched APKs are attached to that same release and to the run's Artifacts.
+#   or:  Actions -> "Patch APK" -> Run workflow -> paste direct download URL(s).
+# Pitch: negative = deeper, positive = higher. Run-workflow input; releases use -4.
+name: Patch APK
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      apk_urls:
+        description: Direct URL(s) to the APK, split APKs or a .apkm/.xapk/.apks bundle (space-separated)
+        required: true
+      semitones:
+        description: Pitch shift in semitones (negative = deeper)
+        default: "-4"
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SEMITONES: ${{ github.event.inputs.semitones || '-4' }}
+      EVENT: ${{ github.event_name }}
+      TAG: ${{ github.event.release.tag_name }}
+      APK_URLS: ${{ github.event.inputs.apk_urls }}
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build voice-changer module
+        run: |
+          set -euo pipefail
+          [[ "$SEMITONES" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || { echo "semitones must be a number"; exit 1; }
+          M=voicemod
+          J=$M/app/src/main/java/dev/voicemod
+          X=$M/xposed-stub/src/main/java/de/robv/android/xposed
+          mkdir -p "$(dirname $M/settings.gradle)"
+          cat > $M/settings.gradle <<'EOF_A'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = 'voicemod'
+          include ':app', ':xposed-stub'
+          EOF_A
+          mkdir -p "$(dirname $M/build.gradle)"
+          cat > $M/build.gradle <<'EOF_B'
+          plugins { id 'com.android.application' version '8.5.2' apply false }
+          EOF_B
+          mkdir -p "$(dirname $M/xposed-stub/build.gradle)"
+          cat > $M/xposed-stub/build.gradle <<'EOF_C'
+          plugins { id 'java-library' }
+          java {
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+          }
+          EOF_C
+          mkdir -p "$(dirname $M/app/build.gradle)"
+          cat > $M/app/build.gradle <<'EOF_D'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'dev.voicemod'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'dev.voicemod'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          dependencies { compileOnly project(':xposed-stub') }
+          EOF_D
+          mkdir -p "$(dirname $M/app/src/main/AndroidManifest.xml)"
+          cat > $M/app/src/main/AndroidManifest.xml <<'EOF_E'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="VoiceMod" android:allowBackup="false">
+                  <meta-data android:name="xposedmodule" android:value="true" />
+                  <meta-data android:name="xposeddescription" android:value="Real-time microphone pitch shifter" />
+                  <meta-data android:name="xposedminversion" android:value="93" />
+              </application>
+          </manifest>
+          EOF_E
+          mkdir -p "$(dirname $M/app/src/main/assets/xposed_init)"
+          cat > $M/app/src/main/assets/xposed_init <<'EOF_F'
+          dev.voicemod.Hook
+          EOF_F
+          mkdir -p "$(dirname $J/Hook.java)"
+          cat > $J/Hook.java <<'EOF_HOOK'
+          package dev.voicemod;
+
+          import android.media.AudioFormat;
+          import android.media.AudioRecord;
+          import android.util.Log;
+          import de.robv.android.xposed.IXposedHookLoadPackage;
+          import de.robv.android.xposed.XC_MethodHook;
+          import de.robv.android.xposed.XposedBridge;
+          import de.robv.android.xposed.callbacks.XC_LoadPackage;
+          import java.nio.ByteBuffer;
+          import java.nio.ByteOrder;
+          import java.util.WeakHashMap;
+
+          /** Pitch-shifts everything the host app reads from the microphone via AudioRecord. */
+          public class Hook implements IXposedHookLoadPackage {
+              private static final String TAG = "VoiceMod";
+              private static final WeakHashMap<AudioRecord, Shifter[]> STATE = new WeakHashMap<>();
+              private static final ThreadLocal<int[]> DEPTH = new ThreadLocal<int[]>() {
+                  @Override protected int[] initialValue() { return new int[1]; }
+              };
+
+              @Override
+              public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lp) {
+                  Log.i(TAG, "loaded in " + lp.packageName + " / " + lp.processName
+                          + ", semitones=" + Config.SEMITONES);
+                  XposedBridge.hookAllMethods(AudioRecord.class, "read", new XC_MethodHook() {
+                      @Override
+                      protected void beforeHookedMethod(MethodHookParam p) {
+                          int[] d = DEPTH.get();
+                          d[0]++;
+                          // read() overloads call each other; only the outermost call edits the data.
+                          p.setObjectExtra("outer", d[0] == 1);
+                          if (p.args.length > 0 && p.args[0] instanceof ByteBuffer) {
+                              p.setObjectExtra("pos", ((ByteBuffer) p.args[0]).position());
+                          }
+                      }
+
+                      @Override
+                      protected void afterHookedMethod(MethodHookParam p) {
+                          DEPTH.get()[0]--;
+                          try {
+                              if (!Boolean.TRUE.equals(p.getObjectExtra("outer"))) return;
+                              Object r = p.getResult();
+                              if (!(r instanceof Integer) || p.args.length == 0) return;
+                              int n = (Integer) r;
+                              if (n <= 0) return;
+                              AudioRecord rec = (AudioRecord) p.thisObject;
+                              if (rec.getAudioFormat() != AudioFormat.ENCODING_PCM_16BIT) return;
+                              Shifter[] sh = shifters(rec);
+                              Object a0 = p.args[0];
+                              if (a0 instanceof short[]) {
+                                  short[] a = (short[]) a0;
+                                  int off = (Integer) p.args[1];
+                                  for (int i = 0; i < n; i++) {
+                                      a[off + i] = sh[i % sh.length].process(a[off + i]);
+                                  }
+                              } else if (a0 instanceof byte[]) {
+                                  shiftBytes(ByteBuffer.wrap((byte[]) a0), (Integer) p.args[1], n, sh);
+                              } else if (a0 instanceof ByteBuffer) {
+                                  Object pos = p.getObjectExtra("pos");
+                                  shiftBytes(((ByteBuffer) a0).duplicate(),
+                                          pos instanceof Integer ? (Integer) pos : 0, n, sh);
+                              }
+                          } catch (Throwable t) {
+                              Log.e(TAG, "hook error", t);
+                          }
+                      }
+                  });
+              }
+
+              private static void shiftBytes(ByteBuffer bb, int off, int n, Shifter[] sh) {
+                  bb.order(ByteOrder.LITTLE_ENDIAN);
+                  for (int i = 0; i < n / 2; i++) {
+                      int idx = off + i * 2;
+                      bb.putShort(idx, sh[i % sh.length].process(bb.getShort(idx)));
+                  }
+              }
+
+              private static Shifter[] shifters(AudioRecord rec) {
+                  synchronized (STATE) {
+                      Shifter[] s = STATE.get(rec);
+                      if (s == null) {
+                          int ch = Math.max(1, rec.getChannelCount());
+                          s = new Shifter[ch];
+                          for (int i = 0; i < ch; i++) s[i] = new Shifter(rec.getSampleRate(), Config.SEMITONES);
+                          STATE.put(rec, s);
+                          Log.i(TAG, "mic capture hooked: " + rec.getSampleRate() + " Hz, " + ch + " ch");
+                      }
+                      return s;
+                  }
+              }
+          }
+          EOF_HOOK
+          mkdir -p "$(dirname $J/Shifter.java)"
+          cat > $J/Shifter.java <<'EOF_SHIFTER'
+          package dev.voicemod;
+
+          /**
+           * Streaming pitch shifter: two crossfaded taps on a delay line whose delay
+           * sweeps at (1 - ratio) samples per sample. Output length == input length,
+           * so it can edit microphone buffers in place. One instance per channel.
+           */
+          final class Shifter {
+              private final float[] buf;
+              private final int size;
+              private final int win;
+              private final float inc;
+              private int w;
+              private float phase;
+
+              Shifter(int sampleRate, float semitones) {
+                  float ratio = (float) Math.pow(2.0, semitones / 12.0);
+                  win = Math.max(256, (int) (sampleRate * 0.035f));
+                  size = win + 8;
+                  buf = new float[size];
+                  inc = (1f - ratio) / win;
+              }
+
+              short process(short x) {
+                  buf[w] = x;
+                  float p2 = phase + 0.5f;
+                  if (p2 >= 1f) p2 -= 1f;
+                  float g1 = 0.5f - 0.5f * (float) Math.cos(2.0 * Math.PI * phase);
+                  float g2 = 0.5f - 0.5f * (float) Math.cos(2.0 * Math.PI * p2);
+                  float y = tap(phase * win) * g1 + tap(p2 * win) * g2;
+                  w = (w + 1) % size;
+                  phase += inc;
+                  if (phase >= 1f) phase -= 1f;
+                  else if (phase < 0f) phase += 1f;
+                  if (y > 32767f) y = 32767f;
+                  else if (y < -32768f) y = -32768f;
+                  return (short) y;
+              }
+
+              private float tap(float delay) {
+                  float pos = w - delay;
+                  while (pos < 0f) pos += size;
+                  int i0 = (int) pos;
+                  float f = pos - i0;
+                  int i1 = i0 + 1 == size ? 0 : i0 + 1;
+                  return buf[i0] * (1f - f) + buf[i1] * f;
+              }
+          }
+          EOF_SHIFTER
+          printf 'package dev.voicemod;\nfinal class Config { static final float SEMITONES = %sf; }\n' "$SEMITONES" > $J/Config.java
+          mkdir -p "$(dirname $X/IXposedHookLoadPackage.java)"
+          cat > $X/IXposedHookLoadPackage.java <<'EOF_S0'
+          package de.robv.android.xposed;
+
+          public interface IXposedHookLoadPackage {
+              void handleLoadPackage(de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam p) throws Throwable;
+          }
+          EOF_S0
+          mkdir -p "$(dirname $X/callbacks/XC_LoadPackage.java)"
+          cat > $X/callbacks/XC_LoadPackage.java <<'EOF_S1'
+          package de.robv.android.xposed.callbacks;
+
+          public class XC_LoadPackage {
+              public static class LoadPackageParam {
+                  public String packageName;
+                  public String processName;
+              }
+          }
+          EOF_S1
+          mkdir -p "$(dirname $X/XC_MethodHook.java)"
+          cat > $X/XC_MethodHook.java <<'EOF_S2'
+          package de.robv.android.xposed;
+
+          public class XC_MethodHook {
+              protected void beforeHookedMethod(MethodHookParam param) throws Throwable {}
+              protected void afterHookedMethod(MethodHookParam param) throws Throwable {}
+
+              public static class MethodHookParam {
+                  public Object thisObject;
+                  public Object[] args;
+                  public Object getResult() { return null; }
+                  public void setObjectExtra(String key, Object o) {}
+                  public Object getObjectExtra(String key) { return null; }
+              }
+          }
+          EOF_S2
+          mkdir -p "$(dirname $X/XposedBridge.java)"
+          cat > $X/XposedBridge.java <<'EOF_S3'
+          package de.robv.android.xposed;
+
+          public class XposedBridge {
+              public static java.util.Set<?> hookAllMethods(Class<?> c, String name, XC_MethodHook cb) { return null; }
+          }
+          EOF_S3
+          gradle -p $M :app:assembleDebug --no-daemon --stacktrace
+          ls -l $M/app/build/outputs/apk/debug/
+
+      - name: Fetch APKs
+        run: |
+          set -euo pipefail
+          mkdir -p in out tools
+          if [ "$EVENT" = release ]; then
+            gh release download "$TAG" --dir in --pattern '*.apk' --pattern '*.apkm' --pattern '*.xapk' --pattern '*.apks'
+          else
+            n=0
+            for u in $APK_URLS; do
+              n=$((n+1))
+              curl -fsSL --retry 3 -o "in/download$n.bin" "$u"
+            done
+          fi
+          # Normalise: plain APKs stay, bundles (.apkm/.xapk/.apks) are unpacked to their split APKs.
+          for f in in/*; do
+            unzip -Z1 "$f" > /tmp/list.txt
+            if grep -qx 'AndroidManifest.xml' /tmp/list.txt; then
+              case "$f" in *.apk) ;; *) mv "$f" "$f.apk" ;; esac
+            else
+              unzip -o -j "$f" '*.apk' -d in/
+              rm "$f"
+            fi
+          done
+          ls -l in
+          ls in/*.apk
+
+      - name: Patch with LSPatch
+        run: |
+          set -euo pipefail
+          gh release download --repo JingMatrix/LSPatch --pattern '*.jar' --dir tools --clobber
+          JAR=$(ls tools/*.jar | head -n1)
+          echo "Using $JAR"
+          java -jar "$JAR" --help || true
+          MOD=voicemod/app/build/outputs/apk/debug/app-debug.apk
+          java -jar "$JAR" in/*.apk -m "$MOD" -l 2 -f -o out
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: patched-apk
+          path: out/*.apk
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        run: gh release upload "$TAG" out/*.apk --clobber
